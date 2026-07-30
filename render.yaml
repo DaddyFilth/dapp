@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: lead-service
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python backend/main.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+    plan: free
