@@ -1,174 +1,97 @@
-from fastapi import FastAPI, Request, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-import sqlite3, os, json, asyncio, httpx
-from datetime import datetime
+from flask import Flask, render_template_string, jsonify, request, redirect
+import sqlite3
 
-app = FastAPI()
-DB = "data/leadservice.db"
-NL = chr(10)
+app = Flask(__name__)
 
-def init_db():
-    os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.executescript("""
-    PRAGMA foreign_keys = ON;
-    DROP TABLE IF EXISTS clients;
-    DROP TABLE IF EXISTS leads;
-    DROP TABLE IF EXISTS drafts;
-    DROP TABLE IF EXISTS replies;
-    DROP TABLE IF EXISTS meetings;
-    CREATE TABLE clients(id INTEGER PRIMARY KEY, name TEXT, website TEXT, calendar_link TEXT, pricing_plan TEXT, stripe_customer_id TEXT);
-    CREATE TABLE leads(id INTEGER PRIMARY KEY, client_id INTEGER, protocol TEXT, tvl REAL, chains TEXT, category TEXT, score INTEGER, contact_email TEXT, contact_name TEXT, status TEXT DEFAULT 'new');
-    CREATE TABLE drafts(id INTEGER PRIMARY KEY, lead_id INTEGER, subject TEXT, body TEXT, status TEXT DEFAULT 'draft', created_at TEXT, approved_at TEXT);
-    CREATE TABLE replies(id INTEGER PRIMARY KEY, lead_id INTEGER, direction TEXT, subject TEXT, body TEXT, category TEXT, created_at TEXT);
-    CREATE TABLE meetings(id INTEGER PRIMARY KEY, lead_id INTEGER, booked_at TEXT, meeting_time TEXT, status TEXT DEFAULT 'booked');
-    """)
+def get_db():
+    conn = sqlite3.connect('../data/leadservice.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+@app.route('/')
+def index():
+    return redirect('/dashboard')
+
+@app.route('/dashboard')
+def dashboard():
+    conn = get_db()
+    total_leads = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+    total_drafts = conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0]
+    approved = conn.execute("SELECT COUNT(*) FROM drafts WHERE status='approved'").fetchone()[0]
+    total_meetings = conn.execute("SELECT COUNT(*) FROM meetings").fetchone()[0]
+    conn.close()
+    rows = ''
+    html = DASH.replace('LEADS', str(total_leads)).replace('DRAFTS', str(total_drafts)).replace('APPROVED', str(approved)).replace('MEETINGS', str(total_meetings)).replace('MATCHES', rows)
+    return html
+
+@app.route('/leads')
+def leads():
+    conn = get_db()
+    leads = conn.execute("SELECT * FROM leads ORDER BY CAST(tvl AS REAL) DESC").fetchall()
+    total = len(leads)
+    conn.close()
+    rows = ''
+    for l in leads:
+        rows += '<tr><td><b>' + l['protocol'] + '</b></td><td>' + str(l['category']) + '</td><td>$' + str(round(float(str(l['tvl']) if l['tvl'] else 0)/1e6, 1)) + 'M</td><td>' + str(l['chains']) + '</td><td>' + str(l['contact_name'] or '-') + '</td></tr>'
+    return LEADS.replace('TOTAL', str(total)).replace('ROWS', rows)
+
+@app.route('/drafts')
+def drafts():
+    conn = get_db()
+    drafts = conn.execute("SELECT * FROM drafts ORDER BY id DESC").fetchall()
+    total = len(drafts)
+    approved = len([d for d in drafts if d['status'] == 'approved'])
+    pending = len([d for d in drafts if d['status'] == 'draft'])
+    sent = len([d for d in drafts if d['status'] == 'sent'])
+    conn.close()
+    rows = ''
+    for d in drafts:
+        st = d['status'] or 'draft'
+        rows += '<tr><td><b>' + str(d['lead_name']) + '</b></td><td>' + str(d['subject']) + '</td><td><span class="status status-' + st + '">' + st.upper() + '</span></td><td class="preview">' + str(d['body'] or '')[:60] + '...</td><td class="actions"><a href="/drafts/' + str(d['id']) + '/view" class="btn btn-view">View</a> <button class="btn btn-approve" onclick="approve(' + str(d['id']) + ')">OK</button> <button class="btn btn-reject" onclick="reject(' + str(d['id']) + ')">X</button></td></tr>'
+    return DRAFTS.replace('TOTAL', str(total)).replace('APPROVED', str(approved)).replace('PENDING', str(pending)).replace('SENT', str(sent)).replace('ROWS', rows)
+
+@app.route('/drafts/<int:id>/view')
+def view_draft(id):
+    conn = get_db()
+    draft = conn.execute("SELECT * FROM drafts WHERE id = ?", (id,)).fetchone()
+    conn.close()
+    if not draft:
+        return "Not found", 404
+    html = VIEW.replace('PROTO', str(draft['lead_name'])).replace('STAT', str(draft['status'] or 'draft').upper()).replace('SUBJ', str(draft['subject'])).replace('BODY', str(draft['body'] or '')).replace('ID', str(draft['id']))
+    return html
+
+@app.route('/drafts/<int:id>/approve', methods=['POST'])
+def approve_draft(id):
+    conn = get_db()
+    conn.execute("UPDATE drafts SET status = 'approved' WHERE id = ?", (id,))
     conn.commit()
     conn.close()
+    return jsonify({'ok': True})
 
-@app.on_event("startup")
-def on_startup():
-    init_db()
-
-@app.get("/")
-async def root():
-    return HTMLResponse("""<!doctype html><html><head><title>Lead Service</title><script src="https://cdn.tailwindcss.com"></script></head><body class="p-8 bg-gray-50"><h1 class="text-3xl font-bold mb-6">Lead Service Dashboard</h1><div class="grid grid-cols-3 gap-4 mb-6"><a href="/drafts" class="bg-blue-500 text-white p-6 rounded-lg hover:bg-blue-600"><h2 class="text-xl font-bold">Drafts</h2><p>Review and approve</p></a><a href="/meetings" class="bg-green-500 text-white p-6 rounded-lg hover:bg-green-600"><h2 class="text-xl font-bold">Meetings</h2><p>Booked calls</p></a><a href="/clients" class="bg-purple-500 text-white p-6 rounded-lg hover:bg-purple-600"><h2 class="text-xl font-bold">Clients</h2><p>Manage clients</p></a></div></body></html>""")
-
-@app.get("/drafts")
-async def drafts_page():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT d.id, d.lead_id, d.subject, d.body, d.status, l.protocol, l.tvl, l.contact_email FROM drafts d LEFT JOIN leads l ON d.lead_id = l.id ORDER BY d.created_at DESC LIMIT 100")
-    rows = c.fetchall()
-    conn.close()
-    
-    drafts_html = ""
-    for r in rows:
-        draft_id, lead_id, subject, body, status, protocol, tvl, email = r
-        status_color = "green" if status == "approved" else "yellow"
-        drafts_html += f"""<div class="bg-white p-4 rounded shadow mb-4">
-            <div class="flex justify-between items-center mb-2">
-                <h3 class="font-bold text-lg">{subject}</h3>
-                <span class="px-2 py-1 rounded bg-{status_color}-100 text-{status_color}-800 text-sm">{status}</span>
-            </div>
-            <p class="text-sm text-gray-600 mb-2">Protocol: {protocol} | TVL: ${int(tvl):,} | Contact: {email or 'N/A'}</p>
-            <div class="bg-gray-50 p-3 rounded mb-3"><pre class="text-sm whitespace-pre-wrap">{body}</pre></div>
-            <div class="flex gap-2">
-                <button onclick="approveDraft({draft_id})" class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600">Approve</button>
-                <button onclick="rejectDraft({draft_id})" class="bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600">Reject</button>
-            </div>
-        </div>"""
-    
-    return HTMLResponse(f"""<!doctype html><html><head><title>Drafts</title><script src="https://cdn.tailwindcss.com"></script></head><body class="p-8 bg-gray-50"><a href="/" class="text-blue-600 mb-4">&larr; Back</a><h1 class="text-3xl font-bold mb-6">Email Drafts</h1>{drafts_html}<script>
-async function approveDraft(id) {{
-    const r = await fetch('/drafts/approve', {{method: 'POST', headers: {{'Content-Type': 'application/x-www-form-urlencoded'}}, body: `draft_id=${{id}}`}});
-    if (r.ok) location.reload();
-}}
-async function rejectDraft(id) {{
-    alert('Draft ' + id + ' rejected (implement delete endpoint)');
-}}
-</script></body></html>""")
-
-@app.get("/drafts-api")
-async def list_drafts():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT id, lead_id, subject, body, status, created_at, approved_at FROM drafts ORDER BY created_at DESC LIMIT 100")
-    rows = c.fetchall()
-    conn.close()
-    return JSONResponse([{"id": r[0], "lead_id": r[1], "subject": r[2], "body": r[3], "status": r[4]} for r in rows])
-
-@app.post("/drafts/generate")
-async def generate_draft(lead_id: int = Form(...)):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT protocol, tvl, chains, contact_name FROM leads WHERE id=?", (lead_id,))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Lead not found")
-    protocol, tvl, chains, contact_name = row
-    subject = "Partnership idea for " + str(protocol)
-    contact = contact_name if contact_name else "there"
-    tvl_fmt = f"{int(tvl):,}"
-    body = "Hi " + contact + "," + NL + NL + "Congrats on " + str(protocol) + " (TVL $" + tvl_fmt + " on " + chains + "). I help DeFi protocols secure institutional partnerships." + NL + NL + "Open to a short chat?" + NL + NL + "Best," + NL + "Your Name"
-    c.execute("INSERT INTO drafts (lead_id, subject, body, status, created_at) VALUES (?,?,?,?,?)", (lead_id, subject, body, "draft", datetime.utcnow().isoformat()))
-    conn.commit()
-    draft_id = c.lastrowid
-    conn.close()
-    return {"draft_id": draft_id}
-
-@app.post("/drafts/approve")
-async def approve_draft(draft_id: int = Form(...)):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("UPDATE drafts SET status='approved', approved_at=? WHERE id=?", (datetime.utcnow().isoformat(), draft_id))
+@app.route('/drafts/<int:id>/send', methods=['POST'])
+def send_draft(id):
+    conn = get_db()
+    conn.execute("UPDATE drafts SET status = 'sent' WHERE id = ?", (id,))
     conn.commit()
     conn.close()
-    return {"status": "approved"}
+    return jsonify({'ok': True})
 
-@app.post("/drafts/generate-bulk")
-async def generate_bulk_drafts(client_id: int = Form(...)):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT id, protocol, tvl, chains, contact_name FROM leads WHERE client_id=?", (client_id,))
-    leads = c.fetchall()
-    draft_ids = []
-    for lead in leads:
-        lead_id, protocol, tvl, chains, contact_name = lead
-        subject = "Partnership idea for " + str(protocol)
-        contact = contact_name if contact_name else "there"
-        tvl_fmt = f"{int(tvl):,}"
-        body = "Hi " + contact + "," + NL + NL + "Congrats on " + str(protocol) + " (TVL $" + tvl_fmt + " on " + chains + "). I help DeFi protocols secure institutional partnerships." + NL + NL + "Open to a short chat?" + NL + NL + "Best," + NL + "Your Name"
-        c.execute("INSERT INTO drafts (lead_id, subject, body, status, created_at) VALUES (?,?,?,?,?)", (lead_id, subject, body, "draft", datetime.utcnow().isoformat()))
-        draft_ids.append(c.lastrowid)
+@app.route('/drafts/<int:id>/reject', methods=['POST'])
+def reject_draft(id):
+    conn = get_db()
+    conn.execute("DELETE FROM drafts WHERE id = ?", (id,))
     conn.commit()
     conn.close()
-    return {"drafts_created": len(draft_ids)}
+    return jsonify({'ok': True})
 
-@app.get("/clients")
-async def list_clients():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT * FROM clients")
-    rows = c.fetchall()
-    conn.close()
-    return JSONResponse([{"id": r[0], "name": r[1]} for r in rows])
+DASH = """<!DOCTYPE html><html><head><title>Dashboard</title><style>body{font-family:Arial;padding:20px;background:#f5f5f5}.container{max-width:1400px;margin:0 auto}h1{color:#333;margin-bottom:20px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-bottom:20px}.stat{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}.stat h3{color:#666;font-size:14px;margin-bottom:5px}.stat .value{font-size:32px;font-weight:bold;color:#2563eb}.section{background:#fff;padding:20px;border-radius:8px;margin-bottom:20px}.nav{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}.nav a{padding:10px 20px;background:#fff;border-radius:8px;text-decoration:none;color:#333}.nav a.active{background:#2563eb;color:#fff}table{width:100%}th,td{padding:12px;text-align:left;border-bottom:1px solid #eee}th{background:#2563eb;color:#fff}tr:hover{background:#f9fafb}.score{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:600}.score-90{background:#dcfce7;color:#16a34a}.score-70{background:#fef3c7;color:#d97706}.btn{padding:6px 12px;border-radius:4px;text-decoration:none;font-size:13px;cursor:pointer;border:none;margin:2px;background:#2563eb;color:#fff}</style></head><body><div class="container"><h1>LeadService Dashboard</h1><div class="nav"><a href="/dashboard" class="active">Dashboard</a><a href="/leads">Leads</a><a href="/drafts">Drafts</a><a href="/ai-matches">AI Matches</a><a href="/meetings">Meetings</a></div><div class="stats"><div class="stat"><h3>Total Leads</h3><div class="value">LEADS</div></div><div class="stat"><h3>Drafts</h3><div class="value">DRAFTS</div></div><div class="stat"><h3>Approved</h3><div class="value">APPROVED</div></div><div class="stat"><h3>Meetings</h3><div class="value">MEETINGS</div></div></div><div class="section"><h2>Top AI Matches</h2><table><thead><tr><th>Score</th><th>Protocol 1</th><th>Protocol 2</th><th>Reasons</th><th>Action</th></tr></thead><tbody>MATCHES</tbody></table></div></div></body></html>"""
 
-@app.post("/clients")
-async def create_client(name: str = Form(...), website: str = Form(...), calendar_link: str = Form(...), pricing_plan: str = Form(...)):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("INSERT INTO clients (name, website, calendar_link, pricing_plan) VALUES (?,?,?,?)", (name, website, calendar_link, pricing_plan))
-    conn.commit()
-    cid = c.lastrowid
-    conn.close()
-    return {"id": cid, "name": name}
+LEADS = """<!DOCTYPE html><html><head><title>Leads</title><style>body{font-family:Arial;padding:20px;background:#f5f5f5}.container{max-width:1400px;margin:0 auto}h1{color:#333}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin:20px 0}.stat{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}.stat h3{color:#666;font-size:14px;margin-bottom:5px}.stat .value{font-size:28px;font-weight:bold;color:#2563eb}table{width:100%;background:#fff;border-radius:8px;overflow:hidden}th,td{padding:12px;text-align:left;border-bottom:1px solid #eee}th{background:#2563eb;color:#fff}tr:hover{background:#f9fafb}.nav{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}.nav a{padding:10px 20px;background:#fff;border-radius:8px;text-decoration:none;color:#333}.nav a.active{background:#2563eb;color:#fff}</style></head><body><div class="container"><h1>Leads (TOTAL)</h1><div class="nav"><a href="/dashboard">Dashboard</a><a href="/leads" class="active">Leads</a><a href="/drafts">Drafts</a><a href="/ai-matches">AI Matches</a><a href="/meetings">Meetings</a></div><div class="stats"><div class="stat"><h3>Total Leads</h3><div class="value">TOTAL</div></div></div><table><thead><tr><th>Protocol</th><th>Category</th><th>TVL</th><th>Chains</th><th>Contact</th></tr></thead><tbody>ROWS</tbody></table></div></body></html>"""
 
-@app.get("/meetings")
-async def list_meetings():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT * FROM meetings ORDER BY booked_at DESC")
-    rows = c.fetchall()
-    conn.close()
-    return JSONResponse([{"id": r[0], "lead_id": r[1], "meeting_time": r[3]} for r in rows])
+DRAFTS = """<!DOCTYPE html><html><head><title>Drafts</title><style>body{font-family:Arial;padding:20px;background:#f5f5f5}.container{max-width:1400px;margin:0 auto}h1{color:#333}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin:20px 0}.stat{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}.stat h3{color:#666;font-size:14px;margin-bottom:5px}.stat .value{font-size:28px;font-weight:bold;color:#2563eb}table{width:100%;background:#fff;border-radius:8px;overflow:hidden}th,td{padding:12px;text-align:left;border-bottom:1px solid #eee}th{background:#2563eb;color:#fff}tr:hover{background:#f9fafb}.nav{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}.nav a{padding:10px 20px;background:#fff;border-radius:8px;text-decoration:none;color:#333}.nav a.active{background:#2563eb;color:#fff}.status{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:600}.status-draft{background:#e0e7ff;color:#4f46e5}.status-approved{background:#dcfce7;color:#16a34a}.status-sent{background:#dbeafe;color:#2563eb}.btn{padding:6px 12px;border-radius:4px;text-decoration:none;font-size:13px;cursor:pointer;border:none;margin:2px}.btn-view{background:#f59e0b;color:#fff}.btn-approve{background:#16a34a;color:#fff}.btn-reject{background:#dc2626;color:#fff}.actions{display:flex;gap:5px}.preview{color:#666;font-size:13px}</style></head><body><div class="container"><h1>Email Drafts</h1><div class="nav"><a href="/dashboard">Dashboard</a><a href="/leads">Leads</a><a href="/drafts" class="active">Drafts</a><a href="/ai-matches">AI Matches</a><a href="/meetings">Meetings</a></div><div class="stats"><div class="stat"><h3>Total Drafts</h3><div class="value">TOTAL</div></div><div class="stat"><h3>Approved</h3><div class="value">APPROVED</div></div><div class="stat"><h3>Pending</h3><div class="value">PENDING</div></div><div class="stat"><h3>Sent</h3><div class="value">SENT</div></div></div><table><thead><tr><th>Protocol</th><th>Subject</th><th>Status</th><th>Preview</th><th>Actions</th></tr></thead><tbody>ROWS</tbody></table></div><script>function approve(id){fetch('/drafts/'+id+'/approve',{method:'POST'}).then(()=>location.reload());}function send(id){fetch('/drafts/'+id+'/send',{method:'POST'}).then(()=>location.reload());}function reject(id){fetch('/drafts/'+id+'/reject',{method:'POST'}).then(()=>location.reload());}</script></body></html>"""
 
-@app.post("/meetings")
-async def create_meeting(lead_id: int = Form(...), meeting_time: str = Form(...)):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("INSERT INTO meetings (lead_id, booked_at, meeting_time) VALUES (?,?,?)", (lead_id, datetime.utcnow().isoformat(), meeting_time))
-    conn.commit()
-    mid = c.lastrowid
-    conn.close()
-    return {"meeting_id": mid}
+VIEW = """<!DOCTYPE html><html><head><title>View Draft</title><style>body{font-family:Arial;padding:20px;background:#f5f5f5}.container{max-width:800px;margin:0 auto;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);padding:30px}h1{color:#333;margin-bottom:10px}.meta{color:#666;font-size:14px;margin-bottom:20px;padding-bottom:20px;border-bottom:2px solid #eee}.subject{font-size:22px;color:#2563eb;margin:20px 0 15px}.body{font-size:16px;line-height:1.8;color:#333;white-space:pre-wrap;background:#f8fafc;padding:25px;border-radius:8px;border:1px solid #e2e8f0}.actions{margin-top:25px;display:flex;gap:10px}.btn{padding:12px 24px;border-radius:4px;text-decoration:none;font-size:14px;cursor:pointer;border:none}.btn-back{background:#64748b;color:#fff}.btn-approve{background:#16a34a;color:#fff}.btn-send{background:#2563eb;color:#fff}.btn-reject{background:#dc2626;color:#fff}</style></head><body><div class="container"><h1>Email Draft</h1><div class="meta"><b>Protocol:</b> PROTO | <b>Status:</b> STAT</div><div class="subject">SUBJ</div><div class="body">BODY</div><div class="actions"><a href="/drafts" class="btn btn-back">Back</a><button class="btn btn-approve" onclick="approve(ID)">Approve</button><button class="btn btn-send" onclick="send(ID)">Send</button><button class="btn btn-reject" onclick="reject(ID)">Reject</button></div></div><script>function approve(id){fetch('/drafts/'+id+'/approve',{method:'POST'}).then(()=>location.href='/drafts');}function send(id){fetch('/drafts/'+id+'/send',{method:'POST'}).then(()=>location.href='/drafts');}function reject(id){fetch('/drafts/'+id+'/reject',{method:'POST'}).then(()=>location.href='/drafts');}</script></body></html>"""
 
-@app.post("/billing/charge")
-async def charge_for_meeting(amount_cents: int = Form(...), customer_email: str = Form(...), description: str = Form(...)):
-    return {"status": "placeholder", "amount": amount_cents, "email": customer_email}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+if __name__ == '__main__':
+    print("LeadService: http://localhost:8001")
+    app.run(host='0.0.0.0', port=8001, debug=False)
